@@ -1,7 +1,18 @@
----
-# Run only staticcheck for now. Additional linters will be enabled one-by-one.
+version: "2"
 linters:
+  default: none
   enable:
     - misspell
+    - modernize
+    - sloglint
     - staticcheck
-  disable-all: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+formatters:
+  exclusions:
+    generated: lax
