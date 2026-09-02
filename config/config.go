@@ -17,14 +17,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"log/slog"
+	"maps"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
-
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
@@ -45,16 +45,26 @@ var (
 		Help:      "Timestamp of the last successful configuration reload.",
 	})
 
-	cfg *ini.File
-
 	opts = ini.LoadOptions{
 		// Do not error on nonexistent file to allow empty string as filename input
 		Loose: true,
 		// MySQL ini file can have boolean keys.
 		AllowBooleanKeys: true,
+		// Ignore the # character in the line to avoid password parsing failure when the MySQL password contains the # symbol
+		IgnoreInlineComment: true,
+		// Remove the first and last quotation marks
+		UnescapeValueDoubleQuotes: true,
 	}
 
 	err error
+
+	// Use the same pattern of TLS version strings as the mysql client binary.
+	tlsVersions = map[string]uint16{
+		"TLSv1.0": tls.VersionTLS10,
+		"TLSv1.1": tls.VersionTLS11,
+		"TLSv1.2": tls.VersionTLS12,
+		"TLSv1.3": tls.VersionTLS13,
+	}
 )
 
 type Config struct {
@@ -67,11 +77,15 @@ type MySqlConfig struct {
 	Host                  string `ini:"host"`
 	Port                  int    `ini:"port"`
 	Socket                string `ini:"socket"`
+	EnableCleartextPlugin bool   `ini:"enable-cleartext-plugin"`
 	SslCa                 string `ini:"ssl-ca"`
 	SslCert               string `ini:"ssl-cert"`
 	SslKey                string `ini:"ssl-key"`
 	TlsInsecureSkipVerify bool   `ini:"ssl-skip-verfication"` //nolint:misspell
 	Tls                   string `ini:"tls"`
+	TlsMinVersion         string `ini:"tls-min-version"`
+	TlsMaxVersion         string `ini:"tls-max-version"`
+	TlsServerName         string `ini:"tls-server-name"`
 }
 
 type MySqlConfigHandler struct {
@@ -86,7 +100,7 @@ func (ch *MySqlConfigHandler) GetConfig() *Config {
 	return ch.Config
 }
 
-func (ch *MySqlConfigHandler) ReloadConfig(filename string, mysqldAddress string, mysqldUser string, tlsInsecureSkipVerify bool, logger log.Logger) error {
+func (ch *MySqlConfigHandler) ReloadConfig(filename string, mysqldAddress string, mysqldUser string, tlsInsecureSkipVerify bool, logger *slog.Logger) error {
 	var host, port string
 	defer func() {
 		if err != nil {
@@ -97,24 +111,33 @@ func (ch *MySqlConfigHandler) ReloadConfig(filename string, mysqldAddress string
 		}
 	}()
 
-	if cfg, err = ini.LoadSources(
+	cfg, err := ini.LoadSources(
 		opts,
 		[]byte("[client]\npassword = ${MYSQLD_EXPORTER_PASSWORD}\n"),
 		filename,
-	); err != nil {
-		return fmt.Errorf("failed to load %s: %w", filename, err)
-	}
-
-	if host, port, err = net.SplitHostPort(mysqldAddress); err != nil {
-		return fmt.Errorf("failed to parse address: %w", err)
+	)
+	if err != nil {
+		return fmt.Errorf("failed to load config from %s: %w", filename, err)
 	}
 
 	if clientSection := cfg.Section("client"); clientSection != nil {
-		if cfgHost := clientSection.Key("host"); cfgHost.String() == "" {
-			cfgHost.SetValue(host)
-		}
-		if cfgPort := clientSection.Key("port"); cfgPort.String() == "" {
-			cfgPort.SetValue(port)
+		// Check if mysqldAddress is a unix socket
+		if prefix := "unix://"; strings.HasPrefix(mysqldAddress, prefix) {
+			socketPath := mysqldAddress[len(prefix):]
+			if cfgSocket := clientSection.Key("socket"); cfgSocket.String() == "" {
+				cfgSocket.SetValue(socketPath)
+			}
+		} else {
+			// Parse as TCP address (host:port)
+			if host, port, err = net.SplitHostPort(mysqldAddress); err != nil {
+				return fmt.Errorf("failed to parse address: %w", err)
+			}
+			if cfgHost := clientSection.Key("host"); cfgHost.String() == "" {
+				cfgHost.SetValue(host)
+			}
+			if cfgPort := clientSection.Key("port"); cfgPort.String() == "" {
+				cfgPort.SetValue(port)
+			}
 		}
 		if cfgUser := clientSection.Key("user"); cfgUser.String() == "" {
 			cfgUser.SetValue(mysqldUser)
@@ -135,19 +158,13 @@ func (ch *MySqlConfigHandler) ReloadConfig(filename string, mysqldAddress string
 			TlsInsecureSkipVerify: tlsInsecureSkipVerify,
 		}
 
-		// FIXME: this error check seems orphaned
-		if err != nil {
-			level.Error(logger).Log("msg", "failed to load config", "section", sectionName, "err", err)
-			continue
-		}
-
 		err = sec.StrictMapTo(mysqlcfg)
 		if err != nil {
-			level.Error(logger).Log("msg", "failed to parse config", "section", sectionName, "err", err)
+			logger.Error("failed to parse config", "section", sectionName, "err", err)
 			continue
 		}
 		if err := mysqlcfg.validateConfig(); err != nil {
-			level.Error(logger).Log("msg", "failed to validate config", "section", sectionName, "err", err)
+			logger.Error("failed to validate config", "section", sectionName, "err", err)
 			continue
 		}
 
@@ -168,10 +185,23 @@ func (m MySqlConfig) validateConfig() error {
 		return fmt.Errorf("no user specified in section or parent")
 	}
 
+	allowedTLSVersions := strings.Join(slices.Sorted(maps.Keys(tlsVersions)), ", ")
+	if _, ok := tlsVersions[m.TlsMinVersion]; !ok && m.TlsMinVersion != "" {
+		return fmt.Errorf("tls-min-version=%s is not allowed, use one of: %s", m.TlsMinVersion, allowedTLSVersions)
+	}
+	if _, ok := tlsVersions[m.TlsMaxVersion]; !ok && m.TlsMaxVersion != "" {
+		return fmt.Errorf("tls-max-version=%s is not allowed, use one of: %s", m.TlsMaxVersion, allowedTLSVersions)
+	}
+	if m.TlsMinVersion != "" && m.TlsMaxVersion != "" {
+		if tlsVersions[m.TlsMinVersion] > tlsVersions[m.TlsMaxVersion] {
+			return fmt.Errorf("tls-min-version must not be higher than tls-max-version: %s > %s", m.TlsMinVersion, m.TlsMaxVersion)
+		}
+	}
+
 	return nil
 }
 
-func (m MySqlConfig) FormDSN(target string) (string, error) {
+func (m MySqlConfig) FormDSN(target string, configSectionName string) (string, error) {
 	config := mysql.NewConfig()
 	config.User = m.User
 	config.Passwd = m.Password
@@ -205,41 +235,62 @@ func (m MySqlConfig) FormDSN(target string) (string, error) {
 		config.TLSConfig = "skip-verify"
 	} else {
 		config.TLSConfig = m.Tls
-		if m.SslCa != "" {
-			if err := m.CustomizeTLS(); err != nil {
+
+		hasCustomTLS := m.SslCa != "" ||
+			m.TlsMinVersion != "" ||
+			m.TlsMaxVersion != "" ||
+			m.TlsServerName != ""
+
+		if hasCustomTLS {
+			if err := m.CustomizeTLS(configSectionName); err != nil {
 				err = fmt.Errorf("failed to register a custom TLS configuration for mysql dsn: %w", err)
 				return "", err
 			}
-			config.TLSConfig = "custom"
+			config.TLSConfig = configSectionName
 		}
+	}
+
+	if m.EnableCleartextPlugin {
+		config.AllowCleartextPasswords = true
 	}
 
 	return config.FormatDSN(), nil
 }
 
-func (m MySqlConfig) CustomizeTLS() error {
+func (m MySqlConfig) CustomizeTLS(configSectionName string) error {
 	var tlsCfg tls.Config
-	caBundle := x509.NewCertPool()
-	pemCA, err := os.ReadFile(m.SslCa)
-	if err != nil {
-		return err
-	}
-	if ok := caBundle.AppendCertsFromPEM(pemCA); ok {
-		tlsCfg.RootCAs = caBundle
-	} else {
-		return fmt.Errorf("failed parse pem-encoded CA certificates from %s", m.SslCa)
-	}
-	if m.SslCert != "" && m.SslKey != "" {
-		certPairs := make([]tls.Certificate, 0, 1)
-		keypair, err := tls.LoadX509KeyPair(m.SslCert, m.SslKey)
+	if m.SslCa != "" {
+		caBundle := x509.NewCertPool()
+		pemCA, err := os.ReadFile(m.SslCa)
 		if err != nil {
-			return fmt.Errorf("failed to parse pem-encoded SSL cert %s or SSL key %s: %w",
-				m.SslCert, m.SslKey, err)
+			return err
 		}
-		certPairs = append(certPairs, keypair)
-		tlsCfg.Certificates = certPairs
+		if ok := caBundle.AppendCertsFromPEM(pemCA); ok {
+			tlsCfg.RootCAs = caBundle
+		} else {
+			return fmt.Errorf("failed parse pem-encoded CA certificates from %s", m.SslCa)
+		}
+		if m.SslCert != "" && m.SslKey != "" {
+			certPairs := make([]tls.Certificate, 0, 1)
+			keypair, err := tls.LoadX509KeyPair(m.SslCert, m.SslKey)
+			if err != nil {
+				return fmt.Errorf("failed to parse pem-encoded SSL cert %s or SSL key %s: %w",
+					m.SslCert, m.SslKey, err)
+			}
+			certPairs = append(certPairs, keypair)
+			tlsCfg.Certificates = certPairs
+		}
+	}
+	if m.TlsMinVersion != "" {
+		tlsCfg.MinVersion = tlsVersions[m.TlsMinVersion]
+	}
+	if m.TlsMaxVersion != "" {
+		tlsCfg.MaxVersion = tlsVersions[m.TlsMaxVersion]
+	}
+	if m.TlsServerName != "" {
+		tlsCfg.ServerName = m.TlsServerName
 	}
 	tlsCfg.InsecureSkipVerify = m.TlsInsecureSkipVerify
-	mysql.RegisterTLSConfig("custom", &tlsCfg)
+	mysql.RegisterTLSConfig(configSectionName, &tlsCfg)
 	return nil
 }

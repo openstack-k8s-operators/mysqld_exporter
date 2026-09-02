@@ -18,8 +18,9 @@ package collector
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 
-	"github.com/go-kit/log"
+	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -31,7 +32,8 @@ const (
 	// timestamps. %s will be replaced by the database and table name.
 	// The second column allows gets the server timestamp at the exact same
 	// time the query is run.
-	slaveHostsQuery = "SHOW SLAVE HOSTS"
+	slaveHostsQuery   = "SHOW SLAVE HOSTS"
+	showReplicasQuery = "SHOW REPLICAS"
 )
 
 // Metric descriptors.
@@ -62,10 +64,27 @@ func (ScrapeSlaveHosts) Version() float64 {
 }
 
 // Scrape collects data from database connection and sends it over channel as prometheus metric.
-func (ScrapeSlaveHosts) Scrape(ctx context.Context, db *sql.DB, ch chan<- prometheus.Metric, logger log.Logger) error {
-	slaveHostsRows, err := db.QueryContext(ctx, slaveHostsQuery)
-	if err != nil {
-		return err
+func (ScrapeSlaveHosts) Scrape(ctx context.Context, instance *instance, ch chan<- prometheus.Metric, logger *slog.Logger) error {
+	var (
+		slaveHostsRows *sql.Rows
+		err            error
+	)
+	db := instance.getDB()
+	// Try SHOW SLAVE HOSTS first (MySQL < 8.4 / MariaDB). On MySQL 8.4+ that
+	// statement was removed, so fall back to SHOW REPLICAS only when the server
+	// reports a syntax/parse error (MySQL error 1064 / ER_PARSE_ERROR:
+	// https://dev.mysql.com/doc/mysql-errors/8.4/en/server-error-reference.html#error_er_parse_error).
+	// Other failures (e.g. permission denied) must be returned as-is so they
+	// are not masked by a secondary syntax error from SHOW REPLICAS on servers
+	// that do not support it.
+	if slaveHostsRows, err = db.QueryContext(ctx, slaveHostsQuery); err != nil {
+		mysqlErr, ok := err.(*mysql.MySQLError)
+		if !ok || mysqlErr.Number != 1064 {
+			return err
+		}
+		if slaveHostsRows, err = db.QueryContext(ctx, showReplicasQuery); err != nil {
+			return err
+		}
 	}
 	defer slaveHostsRows.Close()
 

@@ -15,12 +15,14 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/go-kit/log"
+	"github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/promslog"
 	"github.com/smartystreets/goconvey/convey"
 )
 
@@ -30,6 +32,7 @@ func TestScrapeSlaveHostsOldFormat(t *testing.T) {
 		t.Fatalf("error opening a stub database connection: %s", err)
 	}
 	defer db.Close()
+	inst := &instance{db: db}
 
 	columns := []string{"Server_id", "Host", "Port", "Rpl_recovery_rank", "Master_id"}
 	rows := sqlmock.NewRows(columns).
@@ -39,7 +42,7 @@ func TestScrapeSlaveHostsOldFormat(t *testing.T) {
 
 	ch := make(chan prometheus.Metric)
 	go func() {
-		if err = (ScrapeSlaveHosts{}).Scrape(context.Background(), db, ch, log.NewNopLogger()); err != nil {
+		if err = (ScrapeSlaveHosts{}).Scrape(context.Background(), inst, ch, promslog.NewNopLogger()); err != nil {
 			t.Errorf("error calling function on test: %s", err)
 		}
 		close(ch)
@@ -68,6 +71,7 @@ func TestScrapeSlaveHostsNewFormat(t *testing.T) {
 		t.Fatalf("error opening a stub database connection: %s", err)
 	}
 	defer db.Close()
+	inst := &instance{db: db}
 
 	columns := []string{"Server_id", "Host", "Port", "Master_id", "Slave_UUID"}
 	rows := sqlmock.NewRows(columns).
@@ -77,7 +81,7 @@ func TestScrapeSlaveHostsNewFormat(t *testing.T) {
 
 	ch := make(chan prometheus.Metric)
 	go func() {
-		if err = (ScrapeSlaveHosts{}).Scrape(context.Background(), db, ch, log.NewNopLogger()); err != nil {
+		if err = (ScrapeSlaveHosts{}).Scrape(context.Background(), inst, ch, promslog.NewNopLogger()); err != nil {
 			t.Errorf("error calling function on test: %s", err)
 		}
 		close(ch)
@@ -106,6 +110,7 @@ func TestScrapeSlaveHostsWithoutSlaveUuid(t *testing.T) {
 		t.Fatalf("error opening a stub database connection: %s", err)
 	}
 	defer db.Close()
+	inst := &instance{db: db}
 
 	columns := []string{"Server_id", "Host", "Port", "Master_id"}
 	rows := sqlmock.NewRows(columns).
@@ -115,7 +120,7 @@ func TestScrapeSlaveHostsWithoutSlaveUuid(t *testing.T) {
 
 	ch := make(chan prometheus.Metric)
 	go func() {
-		if err = (ScrapeSlaveHosts{}).Scrape(context.Background(), db, ch, log.NewNopLogger()); err != nil {
+		if err = (ScrapeSlaveHosts{}).Scrape(context.Background(), inst, ch, promslog.NewNopLogger()); err != nil {
 			t.Errorf("error calling function on test: %s", err)
 		}
 		close(ch)
@@ -133,6 +138,86 @@ func TestScrapeSlaveHostsWithoutSlaveUuid(t *testing.T) {
 	})
 
 	// Ensure all SQL queries were executed
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled exceptions: %s", err)
+	}
+}
+
+func TestScrapeSlaveHostsPermissionErrorNotMasked(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("error opening a stub database connection: %s", err)
+	}
+	defer db.Close()
+	inst := &instance{db: db}
+
+	// Permission denied on SHOW SLAVE HOSTS must be returned as-is.
+	// Falling back to SHOW REPLICAS would produce a misleading syntax error
+	// on MariaDB / MySQL versions that do not support that statement.
+	permErr := &mysql.MySQLError{
+		Number:  1227,
+		Message: "Access denied; you need (at least one of) the REPLICATION SLAVE privilege(s) for this operation",
+	}
+	mock.ExpectQuery(sanitizeQuery("SHOW SLAVE HOSTS")).WillReturnError(permErr)
+
+	ch := make(chan prometheus.Metric)
+	scrapeErr := (ScrapeSlaveHosts{}).Scrape(context.Background(), inst, ch, promslog.NewNopLogger())
+	close(ch)
+
+	if scrapeErr == nil {
+		t.Fatal("expected permission error, got nil")
+	}
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(scrapeErr, &mysqlErr) {
+		t.Fatalf("expected *mysql.MySQLError, got %T: %v", scrapeErr, scrapeErr)
+	}
+	if mysqlErr.Number != 1227 {
+		t.Fatalf("expected MySQL error 1227, got %d: %v", mysqlErr.Number, scrapeErr)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled exceptions: %s", err)
+	}
+}
+
+func TestScrapeSlaveHostsFallbackOnSyntaxError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("error opening a stub database connection: %s", err)
+	}
+	defer db.Close()
+	inst := &instance{db: db}
+
+	// SHOW SLAVE HOSTS is gone on MySQL 8.4+; fall back to SHOW REPLICAS.
+	syntaxErr := &mysql.MySQLError{
+		Number:  1064,
+		Message: "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'SLAVE HOSTS'",
+	}
+	mock.ExpectQuery(sanitizeQuery("SHOW SLAVE HOSTS")).WillReturnError(syntaxErr)
+
+	columns := []string{"Server_id", "Host", "Port", "Master_id", "Replica_UUID"}
+	rows := sqlmock.NewRows(columns).
+		AddRow("192168010", "iconnect2", "3306", "192168011", "14cb6624-7f93-11e0-b2c0-c80aa9429562")
+	mock.ExpectQuery(sanitizeQuery("SHOW REPLICAS")).WillReturnRows(rows)
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		if err = (ScrapeSlaveHosts{}).Scrape(context.Background(), inst, ch, promslog.NewNopLogger()); err != nil {
+			t.Errorf("error calling function on test: %s", err)
+		}
+		close(ch)
+	}()
+
+	counterExpected := []MetricResult{
+		{labels: labelMap{"server_id": "192168010", "slave_host": "iconnect2", "port": "3306", "master_id": "192168011", "slave_uuid": "14cb6624-7f93-11e0-b2c0-c80aa9429562"}, value: 1, metricType: dto.MetricType_GAUGE},
+	}
+	convey.Convey("Metrics comparison", t, func() {
+		for _, expect := range counterExpected {
+			got := readMetric(<-ch)
+			convey.So(got, convey.ShouldResemble, expect)
+		}
+	})
+
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("there were unfulfilled exceptions: %s", err)
 	}

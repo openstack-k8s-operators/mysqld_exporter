@@ -17,14 +17,13 @@ package collector
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
-	"reflect"
-	"sort"
+	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/alecthomas/kingpin/v2"
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -39,7 +38,7 @@ const infoSchemaProcesslistQuery = `
 		  FROM information_schema.processlist
 		  WHERE ID != connection_id()
 		    AND TIME >= %d
-		  GROUP BY user, SUBSTRING_INDEX(host, ':', 1), command, state
+		  GROUP BY user, host, command, state
 	`
 
 // Tunable flags.
@@ -97,11 +96,12 @@ func (ScrapeProcesslist) Version() float64 {
 }
 
 // Scrape collects data from database connection and sends it over channel as prometheus metric.
-func (ScrapeProcesslist) Scrape(ctx context.Context, db *sql.DB, ch chan<- prometheus.Metric, logger log.Logger) error {
+func (ScrapeProcesslist) Scrape(ctx context.Context, instance *instance, ch chan<- prometheus.Metric, logger *slog.Logger) error {
 	processQuery := fmt.Sprintf(
 		infoSchemaProcesslistQuery,
 		*processlistMinTime,
 	)
+	db := instance.getDB()
 	processlistRows, err := db.QueryContext(ctx, processQuery)
 	if err != nil {
 		return err
@@ -155,35 +155,25 @@ func (ScrapeProcesslist) Scrape(ctx context.Context, db *sql.DB, ch chan<- prome
 		stateUserCounts[user] += count
 	}
 
-	for _, command := range sortedMapKeys(stateCounts) {
-		for _, state := range sortedMapKeys(stateCounts[command]) {
+	for _, command := range slices.Sorted(maps.Keys(stateCounts)) {
+		for _, state := range slices.Sorted(maps.Keys(stateCounts[command])) {
 			ch <- prometheus.MustNewConstMetric(processlistCountDesc, prometheus.GaugeValue, float64(stateCounts[command][state]), command, state)
 			ch <- prometheus.MustNewConstMetric(processlistTimeDesc, prometheus.GaugeValue, float64(stateTime[command][state]), command, state)
 		}
 	}
 
 	if *processesByHostFlag {
-		for _, host := range sortedMapKeys(stateHostCounts) {
+		for _, host := range slices.Sorted(maps.Keys(stateHostCounts)) {
 			ch <- prometheus.MustNewConstMetric(processesByHostDesc, prometheus.GaugeValue, float64(stateHostCounts[host]), host)
 		}
 	}
 	if *processesByUserFlag {
-		for _, user := range sortedMapKeys(stateUserCounts) {
+		for _, user := range slices.Sorted(maps.Keys(stateUserCounts)) {
 			ch <- prometheus.MustNewConstMetric(processesByUserDesc, prometheus.GaugeValue, float64(stateUserCounts[user]), user)
 		}
 	}
 
 	return nil
-}
-
-func sortedMapKeys(m interface{}) []string {
-	v := reflect.ValueOf(m)
-	keys := make([]string, 0, len(v.MapKeys()))
-	for _, key := range v.MapKeys() {
-		keys = append(keys, key.String())
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func sanitizeState(state string) string {
@@ -202,7 +192,7 @@ func sanitizeState(state string) string {
 		"-": "_",
 	}
 	for r := range replacements {
-		state = strings.Replace(state, r, replacements[r], -1)
+		state = strings.ReplaceAll(state, r, replacements[r])
 	}
 	return state
 }
