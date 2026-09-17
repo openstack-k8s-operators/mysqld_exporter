@@ -1,6 +1,6 @@
 # MySQL Server Exporter [![Build Status](https://travis-ci.org/prometheus/mysqld_exporter.svg)][travis]
 
-[![CircleCI](https://circleci.com/gh/prometheus/mysqld_exporter/tree/main.svg?style=shield)][circleci]
+[![Build Status](https://github.com/prometheus/mysqld_exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/prometheus/mysqld_exporter/actions/workflows/ci.yml)
 [![Docker Repository on Quay](https://quay.io/repository/prometheus/mysqld-exporter/status)][quay]
 [![Docker Pulls](https://img.shields.io/docker/pulls/prom/mysqld-exporter.svg?maxAge=604800)][hub]
 [![Go Report Card](https://goreportcard.com/badge/github.com/prometheus/mysqld_exporter)](https://goreportcard.com/report/github.com/prometheus/mysqld_exporter)
@@ -56,6 +56,7 @@ Sample config file for multiple configurations
 On the prometheus side you can set a scrape config as follows
 
         - job_name: mysql # To get metrics about the mysql exporter’s targets
+          metrics_path: /probe
           params:
             # Not required. Will match value to child in config file. Default value is `client`.
             auth_module: [client.servers]
@@ -108,6 +109,7 @@ collect.info_schema.processlist                              | 5.1           | C
 collect.info_schema.processlist.min_time                     | 5.1           | Minimum time a thread must be in each state to be counted. (default: 0)
 collect.info_schema.query_response_time                      | 5.5           | Collect query response time distribution if query_response_time_stats is ON.
 collect.info_schema.replica_host                             | 5.6           | Collect metrics from information_schema.replica_host_status.
+collect.info_schema.rocksdb_perf_context                     | 5.6           | Collect RocksDB metrics from information_schema.ROCKSDB_PERF_CONTEXT.
 collect.info_schema.tables                                   | 5.1           | Collect metrics from information_schema.tables.
 collect.info_schema.tables.databases                         | 5.1           | The list of databases to collect table stats for, or '`*`' for all.
 collect.info_schema.tablestats                               | 5.1           | If running with userstat=1, set to true to collect table statistics.
@@ -139,12 +141,15 @@ collect.sys.user_summary                                     | 5.7           | C
 ### General Flags
 Name                                       | Description
 -------------------------------------------|--------------------------------------------------------------------------------------------------
-mysqld.address                             | Hostname and port used for connecting to MySQL server, format: `host:port`. (default: `locahost:3306`)
+mysqld.address                             | Hostname and port used for connecting to MySQL server, format: `host:port`. (default: `localhost:3306`)
 mysqld.username                            | Username to be used for connecting to MySQL Server
 config.my-cnf                              | Path to .my.cnf file to read MySQL credentials from. (default: `~/.my.cnf`)
 log.level                                  | Logging verbosity (default: info)
 exporter.lock_wait_timeout                 | Set a lock_wait_timeout (in seconds) on the connection to avoid long metadata locking. (default: 2)
+exporter.enable_lock_wait_timeout          | Enable the lock_wait_timeout connection parameter. Makes the exporter compatible with older versions of MySQL. (default: true)
 exporter.log_slow_filter                   | Add a log_slow_filter to avoid slow query logging of scrapes.  NOTE: Not supported by Oracle MySQL.
+exporter.query_timeout                     | Per-scraper query timeout (in seconds). 0 disables the timeout. (default: 0, disabled)
+exporter.max_open_connections              | Maximum number of open connections to the database per scrape. Must be >= 1. The pool is per scrape request, so in multi-target mode total connections scale with concurrent targets; keep the value within the exporter user's `MAX_USER_CONNECTIONS` grant. (default: 2)
 tls.insecure-skip-verify                   | Ignore tls verification errors.
 web.config.file                            | Path to a [web configuration file](#tls-and-basic-authentication)
 web.listen-address                         | Address to listen on for web interface and telemetry.
@@ -183,10 +188,22 @@ ssl-key=/path/to/ssl/client/key
 ssl-cert=/path/to/ssl/client/cert
 ```
 
+It's possible to also restrict the TLS versions that can be used between the MySQL server and mysqld exporter by specifying versions in the mysql cnf file like this:
+
+```
+tls-min-version=TLSv1.2
+tls-max-version=TLSv1.3
+```
+
+In some environments the MySQL server's TLS certificate SN or SAN may not include the host that mysqld exporter uses to connect to it. This could happen in cases when the certificate includes only DNS names, while mysqld exporter uses an IP address to connect. To allow secure connections in these cases, tls-server-name can be used to specify the server's name to use during verification. The parameter works the same as server_name in Prometheus's scrape config configuration.
+
+```
+tls-server-name=mysql.example
+```
 
 ## Using Docker
 
-You can deploy this exporter using the [prom/mysqld-exporter](https://registry.hub.docker.com/r/prom/mysqld-exporter/) Docker image.
+You can deploy this exporter using the [prom/mysqld-exporter](https://hub.docker.com/r/prom/mysqld-exporter/) Docker image.
 
 For example:
 
@@ -196,9 +213,9 @@ docker pull prom/mysqld-exporter
 
 docker run -d \
   -p 9104:9104 \
+  -v /home/user/user_my.cnf:/.my.cnf \
   --network my-mysql-network  \
   prom/mysqld-exporter
-  --config.my-cnf=<path_to_cnf>
 ```
 
 ## heartbeat
@@ -229,7 +246,6 @@ This can be useful for having different Prometheus servers collect specific metr
 
 There is a set of sample rules, alerts and dashboards available in the [mysqld-mixin](mysqld-mixin/)
 
-[circleci]: https://circleci.com/gh/prometheus/mysqld_exporter
 [hub]: https://hub.docker.com/r/prom/mysqld-exporter/
 [travis]: https://travis-ci.org/prometheus/mysqld_exporter
 [quay]: https://quay.io/repository/prometheus/mysqld-exporter
