@@ -15,18 +15,22 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"maps"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/promlog"
-	"github.com/prometheus/common/promlog/flag"
+	"github.com/prometheus/common/promslog"
+	"github.com/prometheus/common/promslog/flag"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
@@ -60,6 +64,26 @@ var (
 		"tls.insecure-skip-verify",
 		"Ignore certificate and server verification when using a tls connection.",
 	).Bool()
+	exporterLockTimeout = kingpin.Flag(
+		"exporter.lock_wait_timeout",
+		"Set a lock_wait_timeout (in seconds) on the connection to avoid long metadata locking.",
+	).Default("2").Int()
+	enableExporterLockTimeout = kingpin.Flag(
+		"exporter.enable_lock_wait_timeout",
+		"Enable the lock_wait_timeout MySQL connection parameter.",
+	).Default("true").Bool()
+	slowLogFilter = kingpin.Flag(
+		"exporter.log_slow_filter",
+		"Add a log_slow_filter to avoid slow query logging of scrapes. NOTE: Not supported by Oracle MySQL.",
+	).Default("false").Bool()
+	exporterQueryTimeout = kingpin.Flag(
+		"exporter.query_timeout",
+		"Per-scraper query timeout (in seconds). 0 disables the timeout.",
+	).Default("0").Int()
+	exporterMaxOpenConns = kingpin.Flag(
+		"exporter.max_open_connections",
+		"Maximum number of open connections to the database per scrape. Must be >= 1.",
+	).Default("2").Int()
 	toolkitFlags = webflag.AddFlags(kingpin.CommandLine, ":9104")
 	c            = config.MySqlConfigHandler{
 		Config: &config.Config{},
@@ -103,6 +127,7 @@ var scrapers = map[collector.Scraper]bool{
 	collector.ScrapeHeartbeat{}:                           false,
 	collector.ScrapeSlaveHosts{}:                          false,
 	collector.ScrapeReplicaHost{}:                         false,
+	collector.ScrapeRocksDBPerfContext{}:                  false,
 }
 
 func filterScrapers(scrapers []collector.Scraper, collectParams []string) []collector.Scraper {
@@ -127,12 +152,39 @@ func filterScrapers(scrapers []collector.Scraper, collectParams []string) []coll
 	return filteredScrapers
 }
 
-func init() {
-	prometheus.MustRegister(version.NewCollector("mysqld_exporter"))
+func getScrapeTimeoutSeconds(r *http.Request, offset float64) (float64, error) {
+	var timeoutSeconds float64
+	if v := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
+		var err error
+		timeoutSeconds, err = strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse timeout from Prometheus header: %v", err)
+		}
+	}
+	if timeoutSeconds == 0 {
+		return 0, nil
+	}
+	if timeoutSeconds < 0 {
+		return 0, fmt.Errorf("timeout value from Prometheus header is invalid: %f", timeoutSeconds)
+	}
+
+	if offset >= timeoutSeconds {
+		// Ignore timeout offset if it doesn't leave time to scrape.
+		return 0, fmt.Errorf("timeout offset (%f) should be lower than prometheus scrape timeout (%f)", offset, timeoutSeconds)
+	} else {
+		// Subtract timeout offset from timeout.
+		timeoutSeconds -= offset
+	}
+	return timeoutSeconds, nil
 }
 
-func newHandler(scrapers []collector.Scraper, logger log.Logger) http.HandlerFunc {
+func init() {
+	prometheus.MustRegister(versioncollector.NewCollector("mysqld_exporter"))
+}
+
+func newHandler(scrapers []collector.Scraper, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		const authModule string = "client"
 		var dsn string
 		var err error
 		target := ""
@@ -142,12 +194,12 @@ func newHandler(scrapers []collector.Scraper, logger log.Logger) http.HandlerFun
 		}
 
 		cfg := c.GetConfig()
-		cfgsection, ok := cfg.Sections["client"]
+		cfgsection, ok := cfg.Sections[authModule]
 		if !ok {
-			level.Error(logger).Log("msg", "Failed to parse section [client] from config file", "err", err)
+			logger.Error(fmt.Sprintf("Failed to parse section [%s] from config file", authModule), "err", err)
 		}
-		if dsn, err = cfgsection.FormDSN(target); err != nil {
-			level.Error(logger).Log("msg", "Failed to form dsn from section [client]", "err", err)
+		if dsn, err = cfgsection.FormDSN(target, authModule); err != nil {
+			logger.Error(fmt.Sprintf("Failed to form dsn from section [%s]", authModule), "err", err)
 		}
 
 		collect := q["collect[]"]
@@ -155,32 +207,30 @@ func newHandler(scrapers []collector.Scraper, logger log.Logger) http.HandlerFun
 		// Use request context for cancellation when connection gets closed.
 		ctx := r.Context()
 		// If a timeout is configured via the Prometheus header, add it to the context.
-		if v := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
-			timeoutSeconds, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				level.Error(logger).Log("msg", "Failed to parse timeout from Prometheus header", "err", err)
-			} else {
-				if *timeoutOffset >= timeoutSeconds {
-					// Ignore timeout offset if it doesn't leave time to scrape.
-					level.Error(logger).Log("msg", "Timeout offset should be lower than prometheus scrape timeout", "offset", *timeoutOffset, "prometheus_scrape_timeout", timeoutSeconds)
-				} else {
-					// Subtract timeout offset from timeout.
-					timeoutSeconds -= *timeoutOffset
-				}
-				// Create new timeout context with request context as parent.
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSeconds*float64(time.Second)))
-				defer cancel()
-				// Overwrite request with timeout context.
-				r = r.WithContext(ctx)
-			}
+		timeoutSeconds, err := getScrapeTimeoutSeconds(r, *timeoutOffset)
+		if err != nil {
+			logger.Error("Error getting timeout from Prometheus header", "err", err)
+		}
+		if timeoutSeconds > 0 {
+			// Create new timeout context with request context as parent.
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSeconds*float64(time.Second)))
+			defer cancel()
+			// Overwrite request with timeout context.
+			r = r.WithContext(ctx)
 		}
 
 		filteredScrapers := filterScrapers(scrapers, collect)
 
 		registry := prometheus.NewRegistry()
 
-		registry.MustRegister(collector.New(ctx, dsn, filteredScrapers, logger))
+		registry.MustRegister(collector.New(ctx, dsn, filteredScrapers, logger,
+			collector.EnableLockWaitTimeout(*enableExporterLockTimeout),
+			collector.SetLockWaitTimeout(*exporterLockTimeout),
+			collector.SetSlowLogFilter(*slowLogFilter),
+			collector.SetQueryTimeout(time.Duration(*exporterQueryTimeout)*time.Second),
+			collector.SetMaxOpenConns(*exporterMaxOpenConns),
+		))
 
 		gatherers := prometheus.Gatherers{
 			prometheus.DefaultGatherer,
@@ -192,12 +242,27 @@ func newHandler(scrapers []collector.Scraper, logger log.Logger) http.HandlerFun
 	}
 }
 
+func validateExporterFlags(maxOpenConns, queryTimeout int) error {
+	if maxOpenConns < 1 {
+		return fmt.Errorf("invalid value for --exporter.max_open_connections, must be >= 1: %d", maxOpenConns)
+	}
+	if queryTimeout < 0 {
+		return fmt.Errorf("invalid value for --exporter.query_timeout, must be >= 0: %d", queryTimeout)
+	}
+	return nil
+}
+
 func main() {
+	// Sort scrapers by name so that flag registration and processing happen
+	// in a deterministic order, as map iteration order is undefined.
+	sortedScrapers := slices.SortedFunc(maps.Keys(scrapers), func(a, b collector.Scraper) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
 	// Generate ON/OFF flags for all scrapers.
 	scraperFlags := map[collector.Scraper]*bool{}
-	for scraper, enabledByDefault := range scrapers {
+	for _, scraper := range sortedScrapers {
 		defaultOn := "false"
-		if enabledByDefault {
+		if scrapers[scraper] {
 			defaultOn = "true"
 		}
 
@@ -210,27 +275,32 @@ func main() {
 	}
 
 	// Parse flags.
-	promlogConfig := &promlog.Config{}
-	flag.AddFlags(kingpin.CommandLine, promlogConfig)
+	promslogConfig := &promslog.Config{}
+	flag.AddFlags(kingpin.CommandLine, promslogConfig)
 	kingpin.Version(version.Print("mysqld_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
-	logger := promlog.New(promlogConfig)
+	logger := promslog.New(promslogConfig)
 
-	level.Info(logger).Log("msg", "Starting mysqld_exporter", "version", version.Info())
-	level.Info(logger).Log("msg", "Build context", "build_context", version.BuildContext())
+	logger.Info("Starting mysqld_exporter", "version", version.Info())
+	logger.Info("Build context", "build_context", version.BuildContext())
+
+	if err := validateExporterFlags(*exporterMaxOpenConns, *exporterQueryTimeout); err != nil {
+		logger.Error(err.Error())
+		os.Exit(1)
+	}
 
 	var err error
 	if err = c.ReloadConfig(*configMycnf, *mysqldAddress, *mysqldUser, *tlsInsecureSkipVerify, logger); err != nil {
-		level.Info(logger).Log("msg", "Error parsing host config", "file", *configMycnf, "err", err)
+		logger.Info("Error parsing host config", "file", *configMycnf, "err", err)
 		os.Exit(1)
 	}
 
 	// Register only scrapers enabled by flag.
 	enabledScrapers := []collector.Scraper{}
-	for scraper, enabled := range scraperFlags {
-		if *enabled {
-			level.Info(logger).Log("msg", "Scraper enabled", "scraper", scraper.Name())
+	for _, scraper := range sortedScrapers {
+		if *scraperFlags[scraper] {
+			logger.Info("Scraper enabled", "scraper", scraper.Name())
 			enabledScrapers = append(enabledScrapers, scraper)
 		}
 	}
@@ -250,7 +320,7 @@ func main() {
 		}
 		landingPage, err := web.NewLandingPage(landingConfig)
 		if err != nil {
-			level.Error(logger).Log("err", err)
+			logger.Error("Error creating landing page", "err", err)
 			os.Exit(1)
 		}
 		http.Handle("/", landingPage)
@@ -258,14 +328,14 @@ func main() {
 	http.HandleFunc("/probe", handleProbe(enabledScrapers, logger))
 	http.HandleFunc("/-/reload", func(w http.ResponseWriter, r *http.Request) {
 		if err = c.ReloadConfig(*configMycnf, *mysqldAddress, *mysqldUser, *tlsInsecureSkipVerify, logger); err != nil {
-			level.Warn(logger).Log("msg", "Error reloading host config", "file", *configMycnf, "error", err)
+			logger.Warn("Error reloading host config", "file", *configMycnf, "error", err)
 			return
 		}
 		_, _ = w.Write([]byte(`ok`))
 	})
 	srv := &http.Server{}
 	if err := web.ListenAndServe(srv, toolkitFlags, logger); err != nil {
-		level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
+		logger.Error("Error starting HTTP server", "err", err)
 		os.Exit(1)
 	}
 }
