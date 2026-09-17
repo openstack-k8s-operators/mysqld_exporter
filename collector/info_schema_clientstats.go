@@ -17,12 +17,10 @@ package collector
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -161,15 +159,16 @@ func (ScrapeClientStat) Version() float64 {
 }
 
 // Scrape collects data from database connection and sends it over channel as prometheus metric.
-func (ScrapeClientStat) Scrape(ctx context.Context, db *sql.DB, ch chan<- prometheus.Metric, logger log.Logger) error {
+func (ScrapeClientStat) Scrape(ctx context.Context, instance *instance, ch chan<- prometheus.Metric, logger *slog.Logger) error {
 	var varName, varVal string
+	db := instance.getDB()
 	err := db.QueryRowContext(ctx, userstatCheckQuery).Scan(&varName, &varVal)
 	if err != nil {
-		level.Debug(logger).Log("msg", "Detailed client stats are not available.")
+		logger.Debug("Detailed client stats are not available.")
 		return nil
 	}
 	if varVal == "OFF" {
-		level.Debug(logger).Log("msg", "MySQL variable is OFF.", "var", varName)
+		logger.Debug("MySQL variable is OFF.", "var", varName)
 		return nil
 	}
 
@@ -191,7 +190,7 @@ func (ScrapeClientStat) Scrape(ctx context.Context, db *sql.DB, ch chan<- promet
 	var (
 		client             string                                // Holds the client name, which should be in column 0.
 		clientStatData     = make([]float64, len(columnNames)-1) // 1 less because of the client column.
-		clientStatScanArgs = make([]interface{}, len(columnNames))
+		clientStatScanArgs = make([]any, len(columnNames))
 	)
 
 	clientStatScanArgs[0] = &client
@@ -205,8 +204,8 @@ func (ScrapeClientStat) Scrape(ctx context.Context, db *sql.DB, ch chan<- promet
 		}
 
 		// Loop over column names, and match to scan data. Unknown columns
-		// will be filled with an untyped metric number. We assume other then
-		// cient, that we'll only get numbers.
+		// will be filled with an untyped metric number. We assume other than
+		// client, that we'll only get numbers.
 		for idx, columnName := range columnNames[1:] {
 			if metricType, ok := informationSchemaClientStatisticsTypes[columnName]; ok {
 				ch <- prometheus.MustNewConstMetric(metricType.desc, metricType.vtype, float64(clientStatData[idx]), client)
